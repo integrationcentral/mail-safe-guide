@@ -1,0 +1,13 @@
+{
+  "name": "mail-safe-guide",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A friendly MX and DMARC setup guide with live DNS checks.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
