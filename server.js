@@ -6,6 +6,9 @@ const { domainToASCII } = require('node:url');
 
 const publicDir = path.join(__dirname, 'public');
 const port = Number(process.env.PORT || 3000);
+const resultCache = new Map();
+const cacheMs = 60_000;
+let activeChecks = 0;
 
 function cleanDomain(value = '') {
   const input = String(value ?? '').trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split('@').pop().replace(/:\d+$/, '').replace(/\.$/, '');
@@ -13,7 +16,8 @@ function cleanDomain(value = '') {
 }
 
 function validDomain(domain) {
-  return Boolean(domain) && domain.length <= 253 && /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i.test(domain);
+  const privateSuffix = /\.(?:internal|local|localhost|invalid|test|example|home|lan)$/i;
+  return Boolean(domain) && domain.length <= 253 && !privateSuffix.test(domain) && /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i.test(domain);
 }
 
 function validSelector(selector) {
@@ -21,10 +25,11 @@ function validSelector(selector) {
 }
 
 async function safeResolve(kind, hostname) {
+  let timer;
   try {
     const value = await Promise.race([
       dns[kind](hostname),
-      new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('DNS lookup timed out'), { code: 'ETIMEOUT' })), 6000))
+      new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error('DNS lookup timed out'), { code: 'ETIMEOUT' })), 6000); })
     ]);
     return { value, status: 'found' };
   }
@@ -32,10 +37,13 @@ async function safeResolve(kind, hostname) {
     if (['ENODATA', 'ENOTFOUND'].includes(error.code)) return { value: [], status: 'missing' };
     return { value: [], status: 'unavailable' };
   }
+  finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function dmarcRows(answer) {
-  return answer.map(parts => parts.join('')).filter(row => /^v\s*=\s*DMARC1\s*;/i.test(row));
+  return answer.map(parts => parts.join('')).filter(row => /^v\s*=\s*DMARC1\s*;/.test(row));
 }
 
 async function discoverDmarc(domain) {
@@ -67,35 +75,54 @@ function send(res, status, body, type = 'application/json; charset=utf-8') {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://localhost');
+  let url;
+  try {
+    url = new URL(req.url, 'http://localhost');
+  }
+  catch {
+    return send(res, 400, { error: 'That request could not be read.' });
+  }
   if (url.pathname === '/api/check') {
     const domain = cleanDomain(url.searchParams.get('domain'));
     if (!validDomain(domain)) return send(res, 400, { error: 'Please enter a domain like example.com.' });
     const selector = (url.searchParams.get('selector') || '').trim().toLowerCase().replace(/\._domainkey.*$/, '');
     if (selector && !validSelector(selector)) return send(res, 400, { error: 'That DKIM selector does not look valid. Enter only the part before ._domainkey.' });
-    const [mx, dmarcResult, rootTxt] = await Promise.all([safeResolve('resolveMx', domain), discoverDmarc(domain), safeResolve('resolveTxt', domain)]);
-    const spf = rootTxt.value.map(parts => parts.join('')).filter(row => /^v=spf1\s+/i.test(row));
-    let dkim = null;
-    if (selector) {
-      const host = `${selector}._domainkey.${domain}`;
-      const [dkimTxt, dkimCname] = await Promise.all([safeResolve('resolveTxt', host), safeResolve('resolveCname', host)]);
-      const txtRecords = dkimTxt.value.map(parts => parts.join('')).filter(row => /^v\s*=\s*DKIM1\s*;/i.test(row) && /(?:^|;)\s*p\s*=\s*[^;\s]+/i.test(row));
-      dkim = { selector, host, txt: txtRecords, cname: dkimCname.value, status: txtRecords.length || dkimCname.value.length ? 'found' : (dkimTxt.status === 'unavailable' && dkimCname.status === 'unavailable' ? 'unavailable' : 'missing') };
+    const cacheKey = `${domain}|${selector}`;
+    const cached = resultCache.get(cacheKey);
+    if (cached && Date.now() - cached.savedAt < cacheMs) return send(res, 200, cached.payload);
+    if (activeChecks >= 20) return send(res, 503, { error: 'The checker is busy. Please try again in a moment.' });
+    activeChecks += 1;
+    try {
+      const [mx, dmarcResult, rootTxt] = await Promise.all([safeResolve('resolveMx', domain), discoverDmarc(domain), safeResolve('resolveTxt', domain)]);
+      const spf = rootTxt.value.map(parts => parts.join('')).filter(row => /^v=spf1\s+/i.test(row));
+      let dkim = null;
+      if (selector) {
+        const host = `${selector}._domainkey.${domain}`;
+        const [dkimTxt, dkimCname] = await Promise.all([safeResolve('resolveTxt', host), safeResolve('resolveCname', host)]);
+        const txtRecords = dkimTxt.value.map(parts => parts.join('')).filter(row => /^v\s*=\s*DKIM1\s*;/i.test(row) && /(?:^|;)\s*p\s*=\s*[^;\s]+/i.test(row));
+        dkim = { selector, host, txt: txtRecords, cname: dkimCname.value, status: txtRecords.length || dkimCname.value.length ? 'found' : (dkimTxt.status === 'unavailable' || dkimCname.status === 'unavailable' ? 'unavailable' : 'missing') };
+      }
+      const payload = {
+        domain,
+        mx: mx.value.sort((a, b) => a.priority - b.priority),
+        mxStatus: mx.status,
+        mxNull: mx.value.length === 1 && mx.value[0].priority === 0 && (!mx.value[0].exchange || mx.value[0].exchange === '.'),
+        dmarc: dmarcResult.records,
+        dmarcStatus: dmarcResult.status,
+        dmarcPolicyDomain: dmarcResult.policyDomain,
+        dmarcInherited: dmarcResult.inherited,
+        spf,
+        spfStatus: rootTxt.status,
+        dkim,
+        checkedAt: new Date().toISOString()
+      };
+      resultCache.set(cacheKey, { savedAt: Date.now(), payload });
+      if (resultCache.size > 500) resultCache.delete(resultCache.keys().next().value);
+      return send(res, 200, payload);
     }
-    return send(res, 200, {
-      domain,
-      mx: mx.value.sort((a, b) => a.priority - b.priority),
-      mxStatus: mx.status,
-      mxNull: mx.value.length === 1 && mx.value[0].priority === 0 && (!mx.value[0].exchange || mx.value[0].exchange === '.'),
-      dmarc: dmarcResult.records,
-      dmarcStatus: dmarcResult.status,
-      dmarcPolicyDomain: dmarcResult.policyDomain,
-      dmarcInherited: dmarcResult.inherited,
-      spf,
-      spfStatus: rootTxt.status,
-      dkim,
-      checkedAt: new Date().toISOString()
-    });
+    finally {
+      activeChecks -= 1;
+    }
   }
   if (url.pathname === '/health') return send(res, 200, { ok: true });
   const relative = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
@@ -111,6 +138,10 @@ const server = http.createServer(async (req, res) => {
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
   });
   fs.createReadStream(file).pipe(res);
+});
+
+server.on('clientError', (_error, socket) => {
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
 });
 
 if (require.main === module) server.listen(port, () => console.log(`Mail Safe Guide is ready on http://localhost:${port}`));
